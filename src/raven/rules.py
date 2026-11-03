@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from raven.contracts import HardRule, Item, RuleCheck, RuleOperator, RuleResult
@@ -12,8 +12,8 @@ def _resolve(item: Item, field: str) -> Any:
             return None
         created_at = item.created_at
         if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
+            created_at = created_at.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - created_at).total_seconds() / 3600
 
     value: Any = item.model_dump(mode="python")
     for part in field.split("."):
@@ -55,8 +55,14 @@ def _matches(actual: Any, rule: HardRule) -> bool:
 
 
 def evaluate_rules(item: Item, rules: list[HardRule]) -> RuleResult:
-    checks = [
-        RuleCheck(rule_id=rule.id, passed=_matches(actual := _resolve(item, rule.field), rule), actual=actual)
-        for rule in rules
-    ]
+    checks: list[RuleCheck] = []
+    for rule in rules:
+        actual = _resolve(item, rule.field)
+        checks.append(
+            RuleCheck(
+                rule_id=rule.id,
+                passed=_matches(actual, rule),
+                actual=actual,
+            )
+        )
     return RuleResult(passed=all(check.passed for check in checks), checks=checks)
