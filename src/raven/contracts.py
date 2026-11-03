@@ -56,6 +56,10 @@ class JudgeConfig(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class IntervalSchedule(BaseModel):
+    interval_seconds: float = Field(default=600, gt=0)
+
+
 class WatchSpec(BaseModel):
     version: Literal["1"] = "1"
     id: str | None = None
@@ -66,6 +70,7 @@ class WatchSpec(BaseModel):
     semantic_criteria: list[SemanticCriterion] = Field(default_factory=list)
     scoring_rubric: list[RubricDimension] = Field(default_factory=list)
     mode: WatchMode = WatchMode.BALANCED
+    schedule: IntervalSchedule = Field(default_factory=IntervalSchedule)
     judge: JudgeConfig | None = None
     explicit_constraints: list[str] = Field(default_factory=list)
     inferred_preferences: list[str] = Field(default_factory=list)

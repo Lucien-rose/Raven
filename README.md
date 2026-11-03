@@ -25,9 +25,20 @@ Host AI -> WatchSpec -> Raven
 GitHub API -> Item -> Diff -> Hard Rules -> Optional Judge -> Candidate -> Event -> Host AI
 ```
 
-The current GitHub adapter uses the documented REST API and persists ETag cursors, so an unchanged source can return `304 Not Modified` without repeating the full payload.
+The current GitHub adapter uses the documented REST API and persists ETag cursors. Diff state is tracked per Watch, so multiple intents can safely observe the same source without consuming each other's changes.
 
-Raven is intentionally small at this stage. No dashboard, browser automation, vector database, or bundled general-purpose LLM.
+Raven starts its scheduler inside the MCP server lifespan and shuts it down with the server. There are no hidden worker threads or import-time background tasks.
+
+## Event delivery
+
+Raven emits internal `candidate.ready` events into a durable outbox.
+
+The MCP Triggers & Events work is still experimental, so Raven does not hard-code a private callback protocol into core. Hosts without proactive callbacks can use:
+
+- `list_pending_events`
+- `acknowledge_event`
+
+A transport adapter can later deliver the same internal event through a standardized callback mechanism without changing the Watch runtime.
 
 ## MCP tools
 
@@ -36,6 +47,8 @@ Raven is intentionally small at this stage. No dashboard, browser automation, ve
 - `list_watches` — list active or all Watches.
 - `set_watch_status` — pause or reactivate a Watch.
 - `check_watch_now` — run one Watch through its source, diff, and hard-rule pipeline now.
+- `list_pending_events` — read undelivered events as a compatibility fallback.
+- `acknowledge_event` — acknowledge a delivered event.
 
 A semantic judge is optional. If a Watch requests one, Raven requires a configured judge adapter rather than silently skipping semantic judgment.
 

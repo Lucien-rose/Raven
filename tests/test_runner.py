@@ -10,35 +10,24 @@ from raven.storage import SQLiteStorage
 class FakeAdapter:
     def __init__(self, item: Item) -> None:
         self.item = item
-        self.cursors: list[str | None] = []
+        self.cursors: dict[str, str] = {}
 
     async def fetch(self, source: SourceBinding, cursor: str | None = None) -> FetchBatch:
-        self.cursors.append(cursor)
-        if cursor is not None:
+        expected = self.cursors.get(source.target)
+        if cursor is not None and cursor == expected:
             return FetchBatch(cursor=cursor)
-        return FetchBatch(items=[self.item], cursor="etag-1")
+
+        etag = f"etag:{source.target}"
+        self.cursors[source.target] = etag
+        return FetchBatch(items=[self.item], cursor=etag)
 
 
 @pytest.mark.asyncio
-async def test_runner_persists_source_cursor_and_returns_candidate_once(tmp_path) -> None:
+async def test_runner_keeps_diff_state_per_watch(tmp_path) -> None:
     storage = SQLiteStorage(tmp_path / "raven.db")
     storage.init()
 
     source = SourceBinding(type="github", target="owner/repo")
-    watch = WatchSpec(
-        id="watch-1",
-        name="Fresh open issues",
-        original_intent="Watch fresh open issues",
-        sources=[source],
-        hard_rules=[
-            HardRule(
-                id="open",
-                field="metadata.state",
-                operator=RuleOperator.EQUALS,
-                value="open",
-            )
-        ],
-    )
     item = Item(
         source_type="github",
         source_id="owner/repo",
@@ -50,9 +39,28 @@ async def test_runner_persists_source_cursor_and_returns_candidate_once(tmp_path
     adapter = FakeAdapter(item)
     runner = WatchRunner(storage, {"github": adapter}, WatchRuntime())
 
-    first = await runner.run_once(watch)
-    second = await runner.run_once(watch)
+    watches = [
+        WatchSpec(
+            id=f"watch-{index}",
+            name="Fresh open issues",
+            original_intent="Watch fresh open issues",
+            sources=[source],
+            hard_rules=[
+                HardRule(
+                    id="open",
+                    field="metadata.state",
+                    operator=RuleOperator.EQUALS,
+                    value="open",
+                )
+            ],
+        )
+        for index in (1, 2)
+    ]
+
+    first = await runner.run_once(watches[0])
+    second = await runner.run_once(watches[1])
 
     assert len(first) == 1
-    assert second == []
-    assert adapter.cursors == [None, "etag-1"]
+    assert len(second) == 1
+    assert await runner.run_once(watches[0]) == []
+    assert await runner.run_once(watches[1]) == []

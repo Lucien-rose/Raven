@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from raven.contracts import Item, SemanticVerdict, SourceBinding, WatchSpec
+from raven.events import CandidateReadyEvent
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS watches (
@@ -37,12 +39,22 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE TABLE IF NOT EXISTS watch_item_state (
     watch_id TEXT NOT NULL,
     item_key TEXT NOT NULL,
+    last_item_json TEXT NOT NULL,
     last_decision TEXT,
     last_confidence REAL,
-    evaluated_input_hash TEXT NOT NULL,
+    evaluated_input_hash TEXT,
     judge_summary_json TEXT,
-    last_evaluated_at TEXT NOT NULL,
+    last_evaluated_at TEXT,
+    last_seen_at TEXT NOT NULL,
     PRIMARY KEY (watch_id, item_key)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    acknowledged_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -147,7 +159,7 @@ class SQLiteStorage:
                 (watch_id, source_key(source), cursor, _now()),
             )
 
-    def store_item(self, item: Item) -> Item | None:
+    def store_item(self, item: Item) -> None:
         key = item_key(item)
         payload = item.model_dump(mode="json")
         content_hash = fingerprint(payload)
@@ -155,10 +167,9 @@ class SQLiteStorage:
 
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT item_json, first_seen_at FROM items WHERE item_key = ?", (key,)
+                "SELECT first_seen_at FROM items WHERE item_key = ?", (key,)
             ).fetchone()
-            previous = Item.model_validate_json(row[0]) if row else None
-            first_seen_at = row[1] if row else now
+            first_seen_at = row[0] if row else now
             connection.execute(
                 """
                 INSERT INTO items (item_key, item_json, content_hash, first_seen_at, last_seen_at)
@@ -170,9 +181,36 @@ class SQLiteStorage:
                 """,
                 (key, json.dumps(payload), content_hash, first_seen_at, now),
             )
-        return previous
 
-    def save_watch_item_state(
+    def get_watch_item(self, watch_id: str, item: Item) -> Item | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT last_item_json
+                FROM watch_item_state
+                WHERE watch_id = ? AND item_key = ?
+                """,
+                (watch_id, item_key(item)),
+            ).fetchone()
+        return Item.model_validate_json(row[0]) if row else None
+
+    def remember_watch_item(self, watch_id: str, item: Item) -> None:
+        payload = item.model_dump(mode="json")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO watch_item_state (
+                    watch_id, item_key, last_item_json, last_seen_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(watch_id, item_key) DO UPDATE SET
+                    last_item_json = excluded.last_item_json,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (watch_id, item_key(item), json.dumps(payload), _now()),
+            )
+
+    def save_watch_item_evaluation(
         self,
         watch_id: str,
         item: Item,
@@ -186,26 +224,22 @@ class SQLiteStorage:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO watch_item_state (
-                    watch_id, item_key, last_decision, last_confidence,
-                    evaluated_input_hash, judge_summary_json, last_evaluated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(watch_id, item_key) DO UPDATE SET
-                    last_decision = excluded.last_decision,
-                    last_confidence = excluded.last_confidence,
-                    evaluated_input_hash = excluded.evaluated_input_hash,
-                    judge_summary_json = excluded.judge_summary_json,
-                    last_evaluated_at = excluded.last_evaluated_at
+                UPDATE watch_item_state
+                SET last_decision = ?,
+                    last_confidence = ?,
+                    evaluated_input_hash = ?,
+                    judge_summary_json = ?,
+                    last_evaluated_at = ?
+                WHERE watch_id = ? AND item_key = ?
                 """,
                 (
-                    watch_id,
-                    item_key(item),
                     decision,
                     confidence,
                     evaluated_input_hash,
                     json.dumps(summary) if summary is not None else None,
                     _now(),
+                    watch_id,
+                    item_key(item),
                 ),
             )
 
@@ -220,6 +254,47 @@ class SQLiteStorage:
                 (watch_id, item_key(item)),
             ).fetchone()
         return row[0] if row else None
+
+    def save_event(self, event: CandidateReadyEvent) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO events (id, type, payload_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.type,
+                    event.model_dump_json(),
+                    event.created_at.isoformat(),
+                ),
+            )
+
+    def list_pending_events(self, limit: int = 50) -> list[CandidateReadyEvent]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json
+                FROM events
+                WHERE acknowledged_at IS NULL
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [CandidateReadyEvent.model_validate_json(row[0]) for row in rows]
+
+    def acknowledge_event(self, event_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE events
+                SET acknowledged_at = ?
+                WHERE id = ? AND acknowledged_at IS NULL
+                """,
+                (_now(), event_id),
+            )
+        return cursor.rowcount > 0
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path)

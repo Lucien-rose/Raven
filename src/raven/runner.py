@@ -3,7 +3,7 @@ from __future__ import annotations
 from raven.adapters.base import SourceAdapter
 from raven.contracts import CandidateContext, WatchSpec
 from raven.runtime import WatchRuntime
-from raven.storage import SQLiteStorage
+from raven.storage import SQLiteStorage, fingerprint
 
 
 class WatchRunner:
@@ -33,9 +33,31 @@ class WatchRunner:
                 self._storage.set_source_cursor(watch.id, source, batch.cursor)
 
             for item in batch.items:
-                previous = self._storage.store_item(item)
+                previous = self._storage.get_watch_item(watch.id, item)
+                self._storage.store_item(item)
+
                 candidate = await self._runtime.evaluate(watch, item, previous)
-                if candidate is not None:
-                    candidates.append(candidate)
+                self._storage.remember_watch_item(watch.id, item)
+
+                if candidate is None:
+                    continue
+
+                evaluated_input_hash = fingerprint(
+                    {
+                        "watch": watch.model_dump(mode="json"),
+                        "item": item.model_dump(mode="json"),
+                        "diff": candidate.diff,
+                    }
+                )
+                if self._storage.get_evaluated_input_hash(watch.id, item) == evaluated_input_hash:
+                    continue
+
+                self._storage.save_watch_item_evaluation(
+                    watch.id,
+                    item,
+                    evaluated_input_hash,
+                    candidate.semantic_verdict,
+                )
+                candidates.append(candidate)
 
         return candidates
