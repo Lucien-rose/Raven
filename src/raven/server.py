@@ -6,15 +6,22 @@ from uuid import uuid4
 
 from mcp.server import MCPServer
 
-from raven.contracts import WatchSpec
+from raven.adapters.github import GitHubAdapter
+from raven.contracts import CandidateContext, WatchSpec
+from raven.runner import WatchRunner
+from raven.runtime import WatchRuntime
 from raven.storage import SQLiteStorage
 
 mcp = MCPServer("Raven")
 
-_storage = SQLiteStorage(
-    Path(os.getenv("RAVEN_DB", "~/.raven/raven.db")).expanduser()
-)
+_storage = SQLiteStorage(Path(os.getenv("RAVEN_DB", "~/.raven/raven.db")).expanduser())
 _storage.init()
+
+_runner = WatchRunner(
+    storage=_storage,
+    adapters={"github": GitHubAdapter()},
+    runtime=WatchRuntime(),
+)
 
 
 @mcp.tool()
@@ -41,6 +48,15 @@ def list_watches(status: str | None = "active") -> list[WatchSpec]:
 def set_watch_status(watch_id: str, status: str) -> bool:
     """Set a Watch status such as active or paused."""
     return _storage.set_watch_status(watch_id, status)
+
+
+@mcp.tool()
+async def check_watch_now(watch_id: str) -> list[CandidateContext]:
+    """Fetch a Watch's sources now and return candidates that passed Raven's current pipeline."""
+    watch = _storage.get_watch(watch_id)
+    if watch is None:
+        raise ValueError(f"Watch {watch_id!r} does not exist")
+    return await _runner.run_once(watch)
 
 
 def main() -> None:

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from raven.contracts import Item, SemanticVerdict, WatchSpec
+from raven.contracts import Item, SemanticVerdict, SourceBinding, WatchSpec
 
 
 _SCHEMA = """
@@ -17,6 +17,14 @@ CREATE TABLE IF NOT EXISTS watches (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS source_state (
+    watch_id TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    cursor TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (watch_id, source_key)
 );
 
 CREATE TABLE IF NOT EXISTS items (
@@ -50,6 +58,10 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 def item_key(item: Item) -> str:
     return f"{item.source_type}:{item.source_id}:{item.external_id}"
+
+
+def source_key(source: SourceBinding) -> str:
+    return f"{source.type}:{source.target}"
 
 
 def fingerprint(value: Any) -> str:
@@ -114,6 +126,27 @@ class SQLiteStorage:
                 (status, _now(), watch_id),
             )
         return cursor.rowcount > 0
+
+    def get_source_cursor(self, watch_id: str, source: SourceBinding) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT cursor FROM source_state WHERE watch_id = ? AND source_key = ?",
+                (watch_id, source_key(source)),
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_source_cursor(self, watch_id: str, source: SourceBinding, cursor: str | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO source_state (watch_id, source_key, cursor, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(watch_id, source_key) DO UPDATE SET
+                    cursor = excluded.cursor,
+                    updated_at = excluded.updated_at
+                """,
+                (watch_id, source_key(source), cursor, _now()),
+            )
 
     def store_item(self, item: Item) -> Item | None:
         key = item_key(item)

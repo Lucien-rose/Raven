@@ -18,6 +18,10 @@ class WatchRuntime:
     ) -> CandidateContext | None:
         if watch.id is None:
             raise ValueError("WatchSpec must have an id before runtime evaluation")
+        if watch.judge is not None and self._judge is None:
+            raise RuntimeError(
+                f"Watch requests judge {watch.judge.adapter!r}, but no judge adapter is configured"
+            )
 
         diff = diff_items(previous, item)
         if previous is not None and not diff:
