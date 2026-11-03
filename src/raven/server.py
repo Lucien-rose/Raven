@@ -14,7 +14,7 @@ from mcp.server.mcpserver import Context
 
 from raven.adapters.github import GitHubAdapter
 from raven.contracts import CandidateContext, WatchSpec
-from raven.events import CandidateReadyEvent, OutboxEventDispatcher
+from raven.events import CandidateReadyEvent, OutboxEventDispatcher, load_pending_events
 from raven.runner import WatchRunner
 from raven.runtime import WatchRuntime
 from raven.scheduler import WatchScheduler
@@ -109,7 +109,7 @@ def list_pending_events(
     limit: int = 50,
 ) -> list[CandidateReadyEvent]:
     """List undelivered Raven events for hosts that do not yet support proactive callbacks."""
-    return ctx.request_context.lifespan_context.storage.list_pending_events(limit)
+    return load_pending_events(ctx.request_context.lifespan_context.storage, limit)
 
 
 @mcp.tool()

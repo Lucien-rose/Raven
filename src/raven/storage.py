@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from raven.contracts import Item, SemanticVerdict, SourceBinding, WatchSpec
-from raven.events import CandidateReadyEvent
 
 
 _SCHEMA = """
@@ -255,22 +254,23 @@ class SQLiteStorage:
             ).fetchone()
         return row[0] if row else None
 
-    def save_event(self, event: CandidateReadyEvent) -> None:
+    def save_event(
+        self,
+        event_id: str,
+        event_type: str,
+        payload_json: str,
+        created_at: str,
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO events (id, type, payload_json, created_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (
-                    event.id,
-                    event.type,
-                    event.model_dump_json(),
-                    event.created_at.isoformat(),
-                ),
+                (event_id, event_type, payload_json, created_at),
             )
 
-    def list_pending_events(self, limit: int = 50) -> list[CandidateReadyEvent]:
+    def list_pending_event_payloads(self, limit: int = 50) -> list[str]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -282,7 +282,7 @@ class SQLiteStorage:
                 """,
                 (limit,),
             ).fetchall()
-        return [CandidateReadyEvent.model_validate_json(row[0]) for row in rows]
+        return [row[0] for row in rows]
 
     def acknowledge_event(self, event_id: str) -> bool:
         with self._connect() as connection:

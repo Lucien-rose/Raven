@@ -1,5 +1,7 @@
-from raven.contracts import Item, WatchSpec
-from raven.events import CandidateReadyEvent
+import pytest
+
+from raven.contracts import CandidateContext, Item, RuleResult, WatchSpec
+from raven.events import CandidateReadyEvent, OutboxEventDispatcher, load_pending_events
 from raven.storage import SQLiteStorage
 
 
@@ -37,16 +39,11 @@ def test_storage_keeps_current_watch_and_watch_item_state(tmp_path) -> None:
     assert storage.get_watch_item("watch-1", updated) == updated
 
 
-def test_storage_persists_and_acknowledges_events(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_event_outbox_persists_and_acknowledges_events(tmp_path) -> None:
     storage = SQLiteStorage(tmp_path / "raven.db")
     storage.init()
 
-    watch = WatchSpec(
-        id="watch-1",
-        name="Test",
-        original_intent="Watch something",
-        sources=[],
-    )
     item = Item(
         source_type="github",
         source_id="owner/repo",
@@ -54,20 +51,20 @@ def test_storage_persists_and_acknowledges_events(tmp_path) -> None:
         url="https://example.test/1",
         title="Bug",
     )
-    from raven.contracts import CandidateContext, RuleResult
-
     event = CandidateReadyEvent(
         watch_id="watch-1",
         candidate=CandidateContext(
             watch_id="watch-1",
-            watch_spec_version=watch.version,
+            watch_spec_version="1",
             item=item,
             diff={"_new": True},
             rule_result=RuleResult(passed=True, checks=[]),
         ),
     )
 
-    storage.save_event(event)
-    assert storage.list_pending_events() == [event]
+    dispatcher = OutboxEventDispatcher(storage)
+    await dispatcher.publish(event)
+
+    assert load_pending_events(storage) == [event]
     assert storage.acknowledge_event(event.id)
-    assert storage.list_pending_events() == []
+    assert load_pending_events(storage) == []

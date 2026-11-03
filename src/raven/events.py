@@ -29,4 +29,19 @@ class OutboxEventDispatcher:
         self._storage = storage
 
     async def publish(self, event: CandidateReadyEvent) -> None:
-        self._storage.save_event(event)
+        self._storage.save_event(
+            event_id=event.id,
+            event_type=event.type,
+            payload_json=event.model_dump_json(),
+            created_at=event.created_at.isoformat(),
+        )
+
+
+def load_pending_events(
+    storage: SQLiteStorage,
+    limit: int = 50,
+) -> list[CandidateReadyEvent]:
+    return [
+        CandidateReadyEvent.model_validate_json(payload)
+        for payload in storage.list_pending_event_payloads(limit)
+    ]
