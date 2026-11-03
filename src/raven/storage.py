@@ -9,7 +9,6 @@ from typing import Any
 
 from raven.contracts import Item, SemanticVerdict, SourceBinding, WatchSpec
 
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS watches (
     id TEXT PRIMARY KEY,
