@@ -29,6 +29,34 @@ The current GitHub adapter uses the documented REST API and persists ETag cursor
 
 Raven starts its scheduler inside the MCP server lifespan and shuts it down with the server. There are no hidden worker threads or import-time background tasks.
 
+## Semantic judges
+
+Judgment is a registry, not a hard dependency. A Watch can omit `judge` entirely and send every hard-rule candidate to the Host AI.
+
+The first bundled adapter is `jev`, using OpenRouter's Decisions API. Configure the server with:
+
+```bash
+export RAVEN_JEV_API_KEY="..."
+# or OPENROUTER_API_KEY
+
+export RAVEN_JEV_MODEL="typesafe/jev-1.14"
+```
+
+Then a Watch can opt in with:
+
+```json
+{
+  "judge": {
+    "adapter": "jev",
+    "config": {
+      "min_confidence": 0.75
+    }
+  }
+}
+```
+
+Secrets stay in the server environment rather than WatchSpec. The model and confidence threshold can vary per Watch.
+
 ## Event delivery
 
 Raven emits internal `candidate.ready` events into a durable outbox.
@@ -46,11 +74,9 @@ A transport adapter can later deliver the same internal event through a standard
 - `get_watch` — inspect one Watch.
 - `list_watches` — list active or all Watches.
 - `set_watch_status` — pause or reactivate a Watch.
-- `check_watch_now` — run one Watch through its source, diff, and hard-rule pipeline now.
+- `check_watch_now` — run one Watch through its source, diff, and judgment pipeline now.
 - `list_pending_events` — read undelivered events as a compatibility fallback.
 - `acknowledge_event` — acknowledge a delivered event.
-
-A semantic judge is optional. If a Watch requests one, Raven requires a configured judge adapter rather than silently skipping semantic judgment.
 
 ## Development
 

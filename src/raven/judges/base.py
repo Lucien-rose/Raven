@@ -12,4 +12,5 @@ class SemanticJudge(Protocol):
         item: Item,
         rule_result: RuleResult,
         diff: dict[str, Any],
+        config: dict[str, Any],
     ) -> SemanticVerdict: ...

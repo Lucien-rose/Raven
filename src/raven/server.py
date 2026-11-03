@@ -15,6 +15,7 @@ from mcp.server.mcpserver import Context
 from raven.adapters.github import GitHubAdapter
 from raven.contracts import CandidateContext, WatchSpec
 from raven.events import CandidateReadyEvent, OutboxEventDispatcher, load_pending_events
+from raven.judges import JevJudge, SemanticJudge
 from raven.runner import WatchRunner
 from raven.runtime import WatchRuntime
 from raven.scheduler import WatchScheduler
@@ -34,10 +35,20 @@ async def app_lifespan(_: MCPServer) -> AsyncIterator[AppContext]:
     storage.init()
 
     async with httpx.AsyncClient(timeout=20) as http_client:
+        judges: dict[str, SemanticJudge] = {}
+        jev_api_key = os.getenv("RAVEN_JEV_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        if jev_api_key:
+            judges["jev"] = JevJudge(
+                client=http_client,
+                api_key=jev_api_key,
+                base_url=os.getenv("RAVEN_JEV_BASE_URL", "https://openrouter.ai"),
+                model=os.getenv("RAVEN_JEV_MODEL", "typesafe/jev-1.14"),
+            )
+
         runner = WatchRunner(
             storage=storage,
             adapters={"github": GitHubAdapter(client=http_client)},
-            runtime=WatchRuntime(),
+            runtime=WatchRuntime(judges),
         )
         scheduler = WatchScheduler(
             storage=storage,
