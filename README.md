@@ -57,35 +57,42 @@ Then a Watch can opt in with:
 
 Secrets stay in the server environment rather than WatchSpec. The model and confidence threshold can vary per Watch.
 
-## Event delivery
+## MCP Events
 
-Raven writes every `candidate.ready` event to a durable outbox before delivery.
+Raven exposes `candidate.ready` through the MCP Events methods used by ChatGPT:
 
-The internal event contains the full Candidate, but proactive delivery sends only a compact trigger:
+- `events/list`
+- `events/subscribe`
+- `events/unsubscribe`
+
+Subscriptions are scoped to the authenticated principal and a specific Watch. One Raven event can fan out to multiple subscriptions without sharing delivery state.
+
+Raven verifies each webhook destination before saving the subscription, requires HTTPS, rejects private/local callback addresses, and signs callback requests with Standard Webhooks. Delivery failures use bounded exponential retry; permanent `410` and `413` responses are not retried.
+
+The callback payload is intentionally compact:
 
 ```json
 {
-  "event_id": "...",
-  "type": "candidate.ready",
-  "watch_id": "...",
-  "created_at": "..."
+  "eventId": "...",
+  "name": "candidate.ready",
+  "timestamp": "...",
+  "data": {
+    "event_id": "...",
+    "watch_id": "...",
+    "title": "...",
+    "url": "...",
+    "source_type": "github",
+    "source_id": "owner/repo"
+  },
+  "cursor": null
 }
 ```
 
-The callback does not carry source content. After a trigger wakes the host, the host reads the full event with `get_event` and acknowledges it after consumption.
+The full Candidate remains in Raven and can be read with `get_event`. Successful webhook delivery and host acknowledgement are separate states.
 
-The first transport is a generic webhook:
+The current Python MCP SDK has public support for custom extension methods but does not yet model the top-level `events` capability directly. Raven keeps that compatibility shim isolated in `mcp_events.py`; Watch, Scheduler, Outbox, and delivery storage do not depend on it.
 
-```bash
-export RAVEN_EVENT_WEBHOOK_URL="https://host.example/raven/events"
-export RAVEN_EVENT_WEBHOOK_TOKEN="optional-bearer-token"
-```
-
-Successful delivery and host acknowledgement are separate states. Failed callback attempts use a small capped exponential retry and remain visible through `get_event_status`.
-
-The MCP Triggers & Events work is still experimental, so the transport layer stays replaceable. When a standardized MCP callback mechanism is ready, it can implement the same `EventTransport` contract without changing Watch, Scheduler, or Event storage.
-
-Hosts without proactive callbacks can continue to use `list_pending_events`.
+Hosts without MCP Events can still use `list_pending_events`.
 
 ## MCP tools
 
@@ -119,7 +126,9 @@ export RAVEN_ALLOWED_HOSTS="raven.example.com,raven.example.com:*"
 
 Browser origins can be allowlisted separately with `RAVEN_ALLOWED_ORIGINS`.
 
-Keep Raven bound to localhost behind Caddy/nginx and terminate TLS at the proxy. The MCP endpoint still needs authentication before public exposure; Raven does not invent a private auth scheme in core.
+Keep Raven bound to localhost behind Caddy/nginx and terminate TLS at the proxy.
+
+Remote user-specific Watches and Events require an authenticated MCP endpoint. Raven scopes Watches, subscriptions, and event reads to the verified request principal; unauthenticated HTTP requests are rejected. Authentication is intentionally not implemented as a home-grown identity service in core.
 
 ## Development
 
