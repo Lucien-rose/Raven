@@ -59,14 +59,33 @@ Secrets stay in the server environment rather than WatchSpec. The model and conf
 
 ## Event delivery
 
-Raven emits internal `candidate.ready` events into a durable outbox.
+Raven writes every `candidate.ready` event to a durable outbox before delivery.
 
-The MCP Triggers & Events work is still experimental, so Raven does not hard-code a private callback protocol into core. Hosts without proactive callbacks can use:
+The internal event contains the full Candidate, but proactive delivery sends only a compact trigger:
 
-- `list_pending_events`
-- `acknowledge_event`
+```json
+{
+  "event_id": "...",
+  "type": "candidate.ready",
+  "watch_id": "...",
+  "created_at": "..."
+}
+```
 
-A transport adapter can later deliver the same internal event through a standardized callback mechanism without changing the Watch runtime.
+The callback does not carry source content. After a trigger wakes the host, the host reads the full event with `get_event` and acknowledges it after consumption.
+
+The first transport is a generic webhook:
+
+```bash
+export RAVEN_EVENT_WEBHOOK_URL="https://host.example/raven/events"
+export RAVEN_EVENT_WEBHOOK_TOKEN="optional-bearer-token"
+```
+
+Successful delivery and host acknowledgement are separate states. Failed callback attempts use a small capped exponential retry and remain visible through `get_event_status`.
+
+The MCP Triggers & Events work is still experimental, so the transport layer stays replaceable. When a standardized MCP callback mechanism is ready, it can implement the same `EventTransport` contract without changing Watch, Scheduler, or Event storage.
+
+Hosts without proactive callbacks can continue to use `list_pending_events`.
 
 ## MCP tools
 
@@ -75,8 +94,10 @@ A transport adapter can later deliver the same internal event through a standard
 - `list_watches` — list active or all Watches.
 - `set_watch_status` — pause or reactivate a Watch.
 - `check_watch_now` — run one Watch through its source, diff, and judgment pipeline now.
-- `list_pending_events` — read undelivered events as a compatibility fallback.
-- `acknowledge_event` — acknowledge a delivered event.
+- `get_event` — fetch a full event after a compact delivery trigger.
+- `get_event_status` — inspect delivery, retry, and acknowledgement state.
+- `list_pending_events` — read unacknowledged events as a compatibility fallback.
+- `acknowledge_event` — acknowledge an event after the host consumes it.
 
 ## Development
 

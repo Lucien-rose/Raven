@@ -55,12 +55,13 @@ CREATE TABLE IF NOT EXISTS events (
     acknowledged_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS notifications (
-    id TEXT PRIMARY KEY,
-    watch_id TEXT NOT NULL,
-    item_key TEXT NOT NULL,
-    receipt_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS event_delivery (
+    event_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    next_attempt_at TEXT,
+    last_error TEXT,
+    delivered_at TEXT
 );
 """
 
@@ -268,6 +269,21 @@ class SQLiteStorage:
                 """,
                 (event_id, event_type, payload_json, created_at),
             )
+            connection.execute(
+                """
+                INSERT INTO event_delivery (event_id, status, attempts)
+                VALUES (?, 'pending', 0)
+                """,
+                (event_id,),
+            )
+
+    def get_event_payload(self, event_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+        return row[0] if row else None
 
     def list_pending_event_payloads(self, limit: int = 50) -> list[str]:
         with self._connect() as connection:
@@ -282,6 +298,96 @@ class SQLiteStorage:
                 (limit,),
             ).fetchall()
         return [row[0] for row in rows]
+
+    def list_events_for_delivery(
+        self,
+        now: str,
+        limit: int = 20,
+    ) -> list[tuple[str, int]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT events.payload_json, event_delivery.attempts
+                FROM events
+                JOIN event_delivery ON event_delivery.event_id = events.id
+                WHERE events.acknowledged_at IS NULL
+                  AND event_delivery.status != 'delivered'
+                  AND (
+                    event_delivery.next_attempt_at IS NULL
+                    OR event_delivery.next_attempt_at <= ?
+                  )
+                ORDER BY events.created_at ASC
+                LIMIT ?
+                """,
+                (now, limit),
+            ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+    def mark_event_delivered(self, event_id: str, delivered_at: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE event_delivery
+                SET status = 'delivered',
+                    attempts = attempts + 1,
+                    next_attempt_at = NULL,
+                    last_error = NULL,
+                    delivered_at = ?
+                WHERE event_id = ?
+                """,
+                (delivered_at, event_id),
+            )
+
+    def mark_event_delivery_failed(
+        self,
+        event_id: str,
+        next_attempt_at: str,
+        error: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE event_delivery
+                SET status = 'retry',
+                    attempts = attempts + 1,
+                    next_attempt_at = ?,
+                    last_error = ?
+                WHERE event_id = ?
+                """,
+                (next_attempt_at, error, event_id),
+            )
+
+    def get_event_delivery_state(self, event_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    event_delivery.event_id,
+                    event_delivery.status,
+                    event_delivery.attempts,
+                    event_delivery.next_attempt_at,
+                    event_delivery.last_error,
+                    event_delivery.delivered_at,
+                    events.acknowledged_at
+                FROM event_delivery
+                JOIN events ON events.id = event_delivery.event_id
+                WHERE event_delivery.event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "event_id": row[0],
+            "delivery": row[1],
+            "attempts": row[2],
+            "next_attempt_at": row[3],
+            "last_error": row[4],
+            "delivered_at": row[5],
+            "acknowledged_at": row[6],
+        }
 
     def acknowledge_event(self, event_id: str) -> bool:
         with self._connect() as connection:

@@ -14,7 +14,15 @@ from mcp.server.mcpserver import Context
 
 from raven.adapters.github import GitHubAdapter
 from raven.contracts import CandidateContext, WatchSpec
-from raven.events import CandidateReadyEvent, OutboxEventDispatcher, load_pending_events
+from raven.delivery import EventDeliveryWorker, WebhookEventTransport
+from raven.events import (
+    CandidateReadyEvent,
+    EventStatus,
+    OutboxEventDispatcher,
+    load_event,
+    load_event_status,
+    load_pending_events,
+)
 from raven.judges import JevJudge, SemanticJudge
 from raven.runner import WatchRunner
 from raven.runtime import WatchRuntime
@@ -55,14 +63,28 @@ async def app_lifespan(_: MCPServer) -> AsyncIterator[AppContext]:
             runner=runner,
             dispatcher=OutboxEventDispatcher(storage),
         )
-        scheduler_task = asyncio.create_task(scheduler.run())
+        tasks = [asyncio.create_task(scheduler.run())]
+
+        webhook_url = os.getenv("RAVEN_EVENT_WEBHOOK_URL")
+        if webhook_url:
+            delivery = EventDeliveryWorker(
+                storage=storage,
+                transport=WebhookEventTransport(
+                    client=http_client,
+                    url=webhook_url,
+                    token=os.getenv("RAVEN_EVENT_WEBHOOK_TOKEN"),
+                ),
+            )
+            tasks.append(asyncio.create_task(delivery.run()))
 
         try:
             yield AppContext(storage=storage, runner=runner, scheduler=scheduler)
         finally:
-            scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await scheduler_task
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
 
 
 mcp = MCPServer("Raven", lifespan=app_lifespan)
@@ -115,11 +137,29 @@ async def check_watch_now(
 
 
 @mcp.tool()
+def get_event(
+    event_id: str,
+    ctx: Context[AppContext],
+) -> CandidateReadyEvent | None:
+    """Return the full Raven event after a delivery trigger wakes the host."""
+    return load_event(ctx.request_context.lifespan_context.storage, event_id)
+
+
+@mcp.tool()
+def get_event_status(
+    event_id: str,
+    ctx: Context[AppContext],
+) -> EventStatus | None:
+    """Return delivery and acknowledgement state for one Raven event."""
+    return load_event_status(ctx.request_context.lifespan_context.storage, event_id)
+
+
+@mcp.tool()
 def list_pending_events(
     ctx: Context[AppContext],
     limit: int = 50,
 ) -> list[CandidateReadyEvent]:
-    """List undelivered Raven events for hosts that do not yet support proactive callbacks."""
+    """List unacknowledged Raven events for hosts without proactive callbacks."""
     return load_pending_events(ctx.request_context.lifespan_context.storage, limit)
 
 
@@ -128,7 +168,7 @@ def acknowledge_event(
     event_id: str,
     ctx: Context[AppContext],
 ) -> bool:
-    """Acknowledge one pending Raven event."""
+    """Acknowledge a Raven event after the host has consumed it."""
     return ctx.request_context.lifespan_context.storage.acknowledge_event(event_id)
 
 

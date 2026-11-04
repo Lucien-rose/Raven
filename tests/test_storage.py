@@ -1,7 +1,13 @@
 import pytest
 
 from raven.contracts import CandidateContext, Item, RuleResult, WatchSpec
-from raven.events import CandidateReadyEvent, OutboxEventDispatcher, load_pending_events
+from raven.events import (
+    CandidateReadyEvent,
+    OutboxEventDispatcher,
+    load_event,
+    load_event_status,
+    load_pending_events,
+)
 from raven.storage import SQLiteStorage
 
 
@@ -65,6 +71,14 @@ async def test_event_outbox_persists_and_acknowledges_events(tmp_path) -> None:
     dispatcher = OutboxEventDispatcher(storage)
     await dispatcher.publish(event)
 
+    assert load_event(storage, event.id) == event
     assert load_pending_events(storage) == [event]
+
+    status = load_event_status(storage, event.id)
+    assert status is not None
+    assert status.delivery == "pending"
+    assert status.attempts == 0
+
     assert storage.acknowledge_event(event.id)
     assert load_pending_events(storage) == []
+    assert load_event_status(storage, event.id).acknowledged_at is not None
