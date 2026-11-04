@@ -12,6 +12,7 @@ from raven.contracts import Item, SemanticVerdict, SourceBinding, WatchSpec
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS watches (
     id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
     spec_json TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -50,18 +51,35 @@ CREATE TABLE IF NOT EXISTS watch_item_state (
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
+    watch_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     acknowledged_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS event_delivery (
-    event_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS event_subscriptions (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    routing_key TEXT NOT NULL,
+    arguments_json TEXT NOT NULL,
+    callback_url TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    refresh_before TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS event_deliveries (
+    event_id TEXT NOT NULL,
+    subscription_id TEXT NOT NULL,
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL,
     next_attempt_at TEXT,
     last_error TEXT,
-    delivered_at TEXT
+    delivered_at TEXT,
+    PRIMARY KEY (event_id, subscription_id)
 );
 """
 
@@ -88,53 +106,88 @@ class SQLiteStorage:
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
 
-    def save_watch(self, watch: WatchSpec, status: str = "active") -> None:
+    def save_watch(self, watch: WatchSpec, owner: str, status: str = "active") -> None:
         if watch.id is None:
             raise ValueError("WatchSpec must have an id before it can be saved")
 
         now = _now()
         with self._connect() as connection:
             existing = connection.execute(
-                "SELECT created_at FROM watches WHERE id = ?", (watch.id,)
+                "SELECT owner, created_at FROM watches WHERE id = ?",
+                (watch.id,),
             ).fetchone()
-            created_at = existing[0] if existing else now
+            if existing is not None and existing[0] != owner:
+                raise PermissionError("Watch belongs to another owner")
+
+            created_at = existing[1] if existing else now
             connection.execute(
                 """
-                INSERT INTO watches (id, spec_json, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO watches (id, owner, spec_json, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     spec_json = excluded.spec_json,
                     status = excluded.status,
                     updated_at = excluded.updated_at
                 """,
-                (watch.id, watch.model_dump_json(), status, created_at, now),
+                (watch.id, owner, watch.model_dump_json(), status, created_at, now),
             )
 
-    def get_watch(self, watch_id: str) -> WatchSpec | None:
+    def get_watch(self, watch_id: str, owner: str | None = None) -> WatchSpec | None:
+        query = "SELECT spec_json FROM watches WHERE id = ?"
+        params: list[Any] = [watch_id]
+        if owner is not None:
+            query += " AND owner = ?"
+            params.append(owner)
+
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT spec_json FROM watches WHERE id = ?", (watch_id,)
-            ).fetchone()
+            row = connection.execute(query, params).fetchone()
         return WatchSpec.model_validate_json(row[0]) if row else None
 
-    def list_watches(self, status: str | None = None) -> list[WatchSpec]:
-        query = "SELECT spec_json FROM watches"
-        params: tuple[Any, ...] = ()
+    def get_watch_owner(self, watch_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT owner FROM watches WHERE id = ?",
+                (watch_id,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def list_watches(
+        self,
+        status: str | None = None,
+        owner: str | None = None,
+    ) -> list[WatchSpec]:
+        clauses: list[str] = []
+        params: list[Any] = []
         if status is not None:
-            query += " WHERE status = ?"
-            params = (status,)
+            clauses.append("status = ?")
+            params.append(status)
+        if owner is not None:
+            clauses.append("owner = ?")
+            params.append(owner)
+
+        query = "SELECT spec_json FROM watches"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY updated_at DESC"
 
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [WatchSpec.model_validate_json(row[0]) for row in rows]
 
-    def set_watch_status(self, watch_id: str, status: str) -> bool:
+    def set_watch_status(
+        self,
+        watch_id: str,
+        status: str,
+        owner: str | None = None,
+    ) -> bool:
+        query = "UPDATE watches SET status = ?, updated_at = ? WHERE id = ?"
+        params: list[Any] = [status, _now(), watch_id]
+        if owner is not None:
+            query += " AND owner = ?"
+            params.append(owner)
+
         with self._connect() as connection:
-            cursor = connection.execute(
-                "UPDATE watches SET status = ?, updated_at = ? WHERE id = ?",
-                (status, _now(), watch_id),
-            )
+            cursor = connection.execute(query, params)
         return cursor.rowcount > 0
 
     def get_source_cursor(self, watch_id: str, source: SourceBinding) -> str | None:
@@ -166,7 +219,8 @@ class SQLiteStorage:
 
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT first_seen_at FROM items WHERE item_key = ?", (key,)
+                "SELECT first_seen_at FROM items WHERE item_key = ?",
+                (key,),
             ).fetchone()
             first_seen_at = row[0] if row else now
             connection.execute(
@@ -254,151 +308,290 @@ class SQLiteStorage:
             ).fetchone()
         return row[0] if row else None
 
+    def upsert_event_subscription(
+        self,
+        subscription_id: str,
+        owner: str,
+        event_name: str,
+        routing_key: str,
+        arguments_json: str,
+        callback_url: str,
+        secret: str,
+        refresh_before: str | None,
+    ) -> None:
+        now = _now()
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT owner, created_at FROM event_subscriptions WHERE id = ?",
+                (subscription_id,),
+            ).fetchone()
+            if existing is not None and existing[0] != owner:
+                raise PermissionError("Subscription belongs to another owner")
+
+            created_at = existing[1] if existing else now
+            connection.execute(
+                """
+                INSERT INTO event_subscriptions (
+                    id, owner, event_name, routing_key, arguments_json,
+                    callback_url, secret, refresh_before, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    secret = excluded.secret,
+                    refresh_before = excluded.refresh_before,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    subscription_id,
+                    owner,
+                    event_name,
+                    routing_key,
+                    arguments_json,
+                    callback_url,
+                    secret,
+                    refresh_before,
+                    created_at,
+                    now,
+                ),
+            )
+
+    def remove_event_subscription(self, subscription_id: str, owner: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM event_subscriptions WHERE id = ? AND owner = ?",
+                (subscription_id, owner),
+            )
+        return cursor.rowcount > 0
+
     def save_event(
         self,
         event_id: str,
         event_type: str,
+        watch_id: str,
         payload_json: str,
         created_at: str,
     ) -> None:
+        owner = self.get_watch_owner(watch_id)
+        if owner is None:
+            raise ValueError(f"Watch {watch_id!r} does not exist")
+
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO events (id, type, payload_json, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO events (
+                    id, type, watch_id, owner, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (event_id, event_type, payload_json, created_at),
+                (event_id, event_type, watch_id, owner, payload_json, created_at),
             )
             connection.execute(
                 """
-                INSERT INTO event_delivery (event_id, status, attempts)
-                VALUES (?, 'pending', 0)
+                INSERT INTO event_deliveries (
+                    event_id, subscription_id, status, attempts
+                )
+                SELECT ?, id, 'pending', 0
+                FROM event_subscriptions
+                WHERE owner = ?
+                  AND event_name = ?
+                  AND routing_key = ?
+                  AND (
+                    refresh_before IS NULL
+                    OR refresh_before > ?
+                  )
                 """,
-                (event_id,),
+                (event_id, owner, event_type, watch_id, created_at),
             )
 
-    def get_event_payload(self, event_id: str) -> str | None:
+    def get_event_payload(self, event_id: str, owner: str | None = None) -> str | None:
+        query = "SELECT payload_json FROM events WHERE id = ?"
+        params: list[Any] = [event_id]
+        if owner is not None:
+            query += " AND owner = ?"
+            params.append(owner)
+
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT payload_json FROM events WHERE id = ?",
-                (event_id,),
-            ).fetchone()
+            row = connection.execute(query, params).fetchone()
         return row[0] if row else None
 
-    def list_pending_event_payloads(self, limit: int = 50) -> list[str]:
+    def list_pending_event_payloads(
+        self,
+        owner: str | None = None,
+        limit: int = 50,
+    ) -> list[str]:
+        query = """
+            SELECT payload_json
+            FROM events
+            WHERE acknowledged_at IS NULL
+        """
+        params: list[Any] = []
+        if owner is not None:
+            query += " AND owner = ?"
+            params.append(owner)
+        query += " ORDER BY created_at ASC LIMIT ?"
+        params.append(limit)
+
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT payload_json
-                FROM events
-                WHERE acknowledged_at IS NULL
-                ORDER BY created_at ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            rows = connection.execute(query, params).fetchall()
         return [row[0] for row in rows]
 
-    def list_events_for_delivery(
+    def list_deliveries_due(
         self,
         now: str,
         limit: int = 20,
-    ) -> list[tuple[str, int]]:
+    ) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT events.payload_json, event_delivery.attempts
-                FROM events
-                JOIN event_delivery ON event_delivery.event_id = events.id
-                WHERE events.acknowledged_at IS NULL
-                  AND event_delivery.status != 'delivered'
+                SELECT
+                    events.payload_json,
+                    event_deliveries.subscription_id,
+                    event_deliveries.attempts,
+                    event_subscriptions.callback_url,
+                    event_subscriptions.secret
+                FROM event_deliveries
+                JOIN events ON events.id = event_deliveries.event_id
+                JOIN event_subscriptions
+                    ON event_subscriptions.id = event_deliveries.subscription_id
+                WHERE event_deliveries.status IN ('pending', 'retry')
                   AND (
-                    event_delivery.next_attempt_at IS NULL
-                    OR event_delivery.next_attempt_at <= ?
+                    event_deliveries.next_attempt_at IS NULL
+                    OR event_deliveries.next_attempt_at <= ?
+                  )
+                  AND (
+                    event_subscriptions.refresh_before IS NULL
+                    OR event_subscriptions.refresh_before > ?
                   )
                 ORDER BY events.created_at ASC
                 LIMIT ?
                 """,
-                (now, limit),
+                (now, now, limit),
             ).fetchall()
-        return [(row[0], row[1]) for row in rows]
 
-    def mark_event_delivered(self, event_id: str, delivered_at: str) -> None:
+        return [
+            {
+                "event_json": row[0],
+                "subscription_id": row[1],
+                "attempts": row[2],
+                "callback_url": row[3],
+                "secret": row[4],
+            }
+            for row in rows
+        ]
+
+    def mark_delivery_succeeded(
+        self,
+        event_id: str,
+        subscription_id: str,
+        delivered_at: str,
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
-                UPDATE event_delivery
+                UPDATE event_deliveries
                 SET status = 'delivered',
                     attempts = attempts + 1,
                     next_attempt_at = NULL,
                     last_error = NULL,
                     delivered_at = ?
-                WHERE event_id = ?
+                WHERE event_id = ? AND subscription_id = ?
                 """,
-                (delivered_at, event_id),
+                (delivered_at, event_id, subscription_id),
             )
 
-    def mark_event_delivery_failed(
+    def mark_delivery_failed(
         self,
         event_id: str,
-        next_attempt_at: str,
+        subscription_id: str,
         error: str,
+        next_attempt_at: str | None,
     ) -> None:
+        status = "retry" if next_attempt_at is not None else "failed"
         with self._connect() as connection:
             connection.execute(
                 """
-                UPDATE event_delivery
-                SET status = 'retry',
+                UPDATE event_deliveries
+                SET status = ?,
                     attempts = attempts + 1,
                     next_attempt_at = ?,
                     last_error = ?
-                WHERE event_id = ?
+                WHERE event_id = ? AND subscription_id = ?
                 """,
-                (next_attempt_at, error, event_id),
+                (
+                    status,
+                    next_attempt_at,
+                    error,
+                    event_id,
+                    subscription_id,
+                ),
             )
 
-    def get_event_delivery_state(self, event_id: str) -> dict[str, Any] | None:
+    def get_event_delivery_states(
+        self,
+        event_id: str,
+        owner: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT
+                event_deliveries.subscription_id,
+                event_deliveries.status,
+                event_deliveries.attempts,
+                event_deliveries.next_attempt_at,
+                event_deliveries.last_error,
+                event_deliveries.delivered_at
+            FROM event_deliveries
+            JOIN events ON events.id = event_deliveries.event_id
+            WHERE event_deliveries.event_id = ?
+        """
+        params: list[Any] = [event_id]
+        if owner is not None:
+            query += " AND events.owner = ?"
+            params.append(owner)
+        query += " ORDER BY event_deliveries.subscription_id"
+
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT
-                    event_delivery.event_id,
-                    event_delivery.status,
-                    event_delivery.attempts,
-                    event_delivery.next_attempt_at,
-                    event_delivery.last_error,
-                    event_delivery.delivered_at,
-                    events.acknowledged_at
-                FROM event_delivery
-                JOIN events ON events.id = event_delivery.event_id
-                WHERE event_delivery.event_id = ?
-                """,
-                (event_id,),
-            ).fetchone()
+            rows = connection.execute(query, params).fetchall()
 
-        if row is None:
-            return None
+        return [
+            {
+                "subscription_id": row[0],
+                "status": row[1],
+                "attempts": row[2],
+                "next_attempt_at": row[3],
+                "last_error": row[4],
+                "delivered_at": row[5],
+            }
+            for row in rows
+        ]
 
-        return {
-            "event_id": row[0],
-            "delivery": row[1],
-            "attempts": row[2],
-            "next_attempt_at": row[3],
-            "last_error": row[4],
-            "delivered_at": row[5],
-            "acknowledged_at": row[6],
-        }
+    def get_event_acknowledged_at(
+        self,
+        event_id: str,
+        owner: str | None = None,
+    ) -> str | None:
+        query = "SELECT acknowledged_at FROM events WHERE id = ?"
+        params: list[Any] = [event_id]
+        if owner is not None:
+            query += " AND owner = ?"
+            params.append(owner)
 
-    def acknowledge_event(self, event_id: str) -> bool:
         with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE events
-                SET acknowledged_at = ?
-                WHERE id = ? AND acknowledged_at IS NULL
-                """,
-                (_now(), event_id),
-            )
+            row = connection.execute(query, params).fetchone()
+        return row[0] if row else None
+
+    def acknowledge_event(self, event_id: str, owner: str | None = None) -> bool:
+        query = """
+            UPDATE events
+            SET acknowledged_at = ?
+            WHERE id = ? AND acknowledged_at IS NULL
+        """
+        params: list[Any] = [_now(), event_id]
+        if owner is not None:
+            query += " AND owner = ?"
+            params.append(owner)
+
+        with self._connect() as connection:
+            cursor = connection.execute(query, params)
         return cursor.rowcount > 0
 
     def _connect(self) -> sqlite3.Connection:
