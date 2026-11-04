@@ -267,8 +267,9 @@ def _validate_secret(secret: str) -> None:
     if not secret.startswith("whsec_"):
         raise ValueError("Webhook secret must use whsec_ format")
     encoded = secret.removeprefix("whsec_")
+    padded = encoded + "=" * (-len(encoded) % 4)
     try:
-        decoded = base64.b64decode(encoded + "==", validate=True)
+        decoded = base64.b64decode(padded, validate=True)
     except ValueError as exc:
         raise ValueError("Webhook secret is not valid base64") from exc
     if not 24 <= len(decoded) <= 64:
