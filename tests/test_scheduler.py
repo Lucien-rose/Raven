@@ -36,7 +36,7 @@ async def test_scheduler_runs_due_watch_and_respects_interval(tmp_path) -> None:
         sources=[],
         schedule=IntervalSchedule(interval_seconds=10),
     )
-    storage.save_watch(watch)
+    storage.save_watch(watch, owner="alice")
 
     candidate = CandidateContext(
         watch_id="watch-1",

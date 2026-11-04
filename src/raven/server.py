@@ -15,7 +15,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from raven.adapters.github import GitHubAdapter
 from raven.contracts import CandidateContext, WatchSpec
-from raven.delivery import EventDeliveryWorker, WebhookEventTransport
+from raven.delivery import EventDeliveryWorker, WebhookSender
 from raven.events import (
     CandidateReadyEvent,
     EventStatus,
@@ -24,7 +24,9 @@ from raven.events import (
     load_event_status,
     load_pending_events,
 )
+from raven.identity import request_principal
 from raven.judges import JevJudge, SemanticJudge
+from raven.mcp_events import OpenAIEvents, advertise_events
 from raven.runner import WatchRunner
 from raven.runtime import WatchRuntime
 from raven.scheduler import WatchScheduler
@@ -36,6 +38,7 @@ class AppContext:
     storage: SQLiteStorage
     runner: WatchRunner
     scheduler: WatchScheduler
+    callback_sender: WebhookSender
 
 
 @asynccontextmanager
@@ -43,7 +46,14 @@ async def app_lifespan(_: MCPServer) -> AsyncIterator[AppContext]:
     storage = SQLiteStorage(Path(os.getenv("RAVEN_DB", "~/.raven/raven.db")).expanduser())
     storage.init()
 
-    async with httpx.AsyncClient(timeout=20) as http_client:
+    async with (
+        httpx.AsyncClient(timeout=20) as http_client,
+        httpx.AsyncClient(
+            timeout=10,
+            follow_redirects=False,
+            trust_env=False,
+        ) as callback_client,
+    ):
         judges: dict[str, SemanticJudge] = {}
         jev_api_key = os.getenv("RAVEN_JEV_API_KEY") or os.getenv("OPENROUTER_API_KEY")
         if jev_api_key:
@@ -54,6 +64,7 @@ async def app_lifespan(_: MCPServer) -> AsyncIterator[AppContext]:
                 model=os.getenv("RAVEN_JEV_MODEL", "typesafe/jev-1.14"),
             )
 
+        callback_sender = WebhookSender(callback_client)
         runner = WatchRunner(
             storage=storage,
             adapters={"github": GitHubAdapter(client=http_client)},
@@ -64,22 +75,19 @@ async def app_lifespan(_: MCPServer) -> AsyncIterator[AppContext]:
             runner=runner,
             dispatcher=OutboxEventDispatcher(storage),
         )
-        tasks = [asyncio.create_task(scheduler.run())]
-
-        webhook_url = os.getenv("RAVEN_EVENT_WEBHOOK_URL")
-        if webhook_url:
-            delivery = EventDeliveryWorker(
-                storage=storage,
-                transport=WebhookEventTransport(
-                    client=http_client,
-                    url=webhook_url,
-                    token=os.getenv("RAVEN_EVENT_WEBHOOK_TOKEN"),
-                ),
-            )
-            tasks.append(asyncio.create_task(delivery.run()))
+        delivery = EventDeliveryWorker(storage, callback_sender)
+        tasks = [
+            asyncio.create_task(scheduler.run()),
+            asyncio.create_task(delivery.run()),
+        ]
 
         try:
-            yield AppContext(storage=storage, runner=runner, scheduler=scheduler)
+            yield AppContext(
+                storage=storage,
+                runner=runner,
+                scheduler=scheduler,
+                callback_sender=callback_sender,
+            )
         finally:
             for task in tasks:
                 task.cancel()
@@ -88,21 +96,28 @@ async def app_lifespan(_: MCPServer) -> AsyncIterator[AppContext]:
                     await task
 
 
-mcp = MCPServer("Raven", lifespan=app_lifespan)
+mcp = MCPServer(
+    "Raven",
+    lifespan=app_lifespan,
+    extensions=[OpenAIEvents()],
+    middleware=[advertise_events],
+)
 
 
 @mcp.tool()
 def create_watch(spec: WatchSpec, ctx: Context[AppContext]) -> WatchSpec:
     """Create a persistent Watch from a host-compiled WatchSpec."""
+    owner = request_principal(ctx.request_context)
     watch = spec.model_copy(update={"id": spec.id or str(uuid4())})
-    ctx.request_context.lifespan_context.storage.save_watch(watch)
+    ctx.request_context.lifespan_context.storage.save_watch(watch, owner=owner)
     return watch
 
 
 @mcp.tool()
 def get_watch(watch_id: str, ctx: Context[AppContext]) -> WatchSpec | None:
     """Return one Watch by id."""
-    return ctx.request_context.lifespan_context.storage.get_watch(watch_id)
+    owner = request_principal(ctx.request_context)
+    return ctx.request_context.lifespan_context.storage.get_watch(watch_id, owner=owner)
 
 
 @mcp.tool()
@@ -111,7 +126,11 @@ def list_watches(
     status: str | None = "active",
 ) -> list[WatchSpec]:
     """List persistent Watches, optionally filtering by status."""
-    return ctx.request_context.lifespan_context.storage.list_watches(status=status)
+    owner = request_principal(ctx.request_context)
+    return ctx.request_context.lifespan_context.storage.list_watches(
+        status=status,
+        owner=owner,
+    )
 
 
 @mcp.tool()
@@ -121,7 +140,12 @@ def set_watch_status(
     ctx: Context[AppContext],
 ) -> bool:
     """Set a Watch status such as active or paused."""
-    return ctx.request_context.lifespan_context.storage.set_watch_status(watch_id, status)
+    owner = request_principal(ctx.request_context)
+    return ctx.request_context.lifespan_context.storage.set_watch_status(
+        watch_id,
+        status,
+        owner=owner,
+    )
 
 
 @mcp.tool()
@@ -131,7 +155,8 @@ async def check_watch_now(
 ) -> list[CandidateContext]:
     """Fetch a Watch's sources now and return candidates that passed Raven's current pipeline."""
     app = ctx.request_context.lifespan_context
-    watch = app.storage.get_watch(watch_id)
+    owner = request_principal(ctx.request_context)
+    watch = app.storage.get_watch(watch_id, owner=owner)
     if watch is None:
         raise ValueError(f"Watch {watch_id!r} does not exist")
     return await app.runner.run_once(watch)
@@ -142,8 +167,13 @@ def get_event(
     event_id: str,
     ctx: Context[AppContext],
 ) -> CandidateReadyEvent | None:
-    """Return the full Raven event after a delivery trigger wakes the host."""
-    return load_event(ctx.request_context.lifespan_context.storage, event_id)
+    """Return the full Raven event after an event webhook wakes the host."""
+    owner = request_principal(ctx.request_context)
+    return load_event(
+        ctx.request_context.lifespan_context.storage,
+        event_id,
+        owner=owner,
+    )
 
 
 @mcp.tool()
@@ -152,7 +182,12 @@ def get_event_status(
     ctx: Context[AppContext],
 ) -> EventStatus | None:
     """Return delivery and acknowledgement state for one Raven event."""
-    return load_event_status(ctx.request_context.lifespan_context.storage, event_id)
+    owner = request_principal(ctx.request_context)
+    return load_event_status(
+        ctx.request_context.lifespan_context.storage,
+        event_id,
+        owner=owner,
+    )
 
 
 @mcp.tool()
@@ -161,7 +196,12 @@ def list_pending_events(
     limit: int = 50,
 ) -> list[CandidateReadyEvent]:
     """List unacknowledged Raven events for hosts without proactive callbacks."""
-    return load_pending_events(ctx.request_context.lifespan_context.storage, limit)
+    owner = request_principal(ctx.request_context)
+    return load_pending_events(
+        ctx.request_context.lifespan_context.storage,
+        owner=owner,
+        limit=limit,
+    )
 
 
 @mcp.tool()
@@ -170,7 +210,11 @@ def acknowledge_event(
     ctx: Context[AppContext],
 ) -> bool:
     """Acknowledge a Raven event after the host has consumed it."""
-    return ctx.request_context.lifespan_context.storage.acknowledge_event(event_id)
+    owner = request_principal(ctx.request_context)
+    return ctx.request_context.lifespan_context.storage.acknowledge_event(
+        event_id,
+        owner=owner,
+    )
 
 
 def main() -> None:
