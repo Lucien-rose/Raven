@@ -11,6 +11,7 @@ from uuid import uuid4
 import httpx
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
+from mcp.server.transport_security import TransportSecuritySettings
 
 from raven.adapters.github import GitHubAdapter
 from raven.contracts import CandidateContext, WatchSpec
@@ -173,7 +174,33 @@ def acknowledge_event(
 
 
 def main() -> None:
-    mcp.run()
+    transport = os.getenv("RAVEN_TRANSPORT", "stdio")
+    if transport == "stdio":
+        mcp.run()
+        return
+    if transport != "streamable-http":
+        raise ValueError(f"Unsupported RAVEN_TRANSPORT: {transport!r}")
+
+    allowed_hosts = _csv_env("RAVEN_ALLOWED_HOSTS")
+    allowed_origins = _csv_env("RAVEN_ALLOWED_ORIGINS")
+    security = None
+    if allowed_hosts:
+        security = TransportSecuritySettings(
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        )
+
+    mcp.run(
+        transport="streamable-http",
+        host=os.getenv("RAVEN_HOST", "127.0.0.1"),
+        port=int(os.getenv("RAVEN_PORT", "8765")),
+        streamable_http_path=os.getenv("RAVEN_MCP_PATH", "/mcp"),
+        transport_security=security,
+    )
+
+
+def _csv_env(name: str) -> list[str]:
+    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
 
 
 if __name__ == "__main__":
