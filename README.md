@@ -99,6 +99,28 @@ Hosts without proactive callbacks can continue to use `list_pending_events`.
 - `list_pending_events` — read unacknowledged events as a compatibility fallback.
 - `acknowledge_event` — acknowledge an event after the host consumes it.
 
+## Remote MCP
+
+The same server can run locally over stdio or remotely over Streamable HTTP.
+
+```bash
+export RAVEN_TRANSPORT="streamable-http"
+export RAVEN_HOST="127.0.0.1"
+export RAVEN_PORT="8765"
+export RAVEN_MCP_PATH="/mcp"
+raven
+```
+
+When a reverse proxy forwards a public hostname, explicitly allow that Host header:
+
+```bash
+export RAVEN_ALLOWED_HOSTS="raven.example.com,raven.example.com:*"
+```
+
+Browser origins can be allowlisted separately with `RAVEN_ALLOWED_ORIGINS`.
+
+Keep Raven bound to localhost behind Caddy/nginx and terminate TLS at the proxy. The MCP endpoint still needs authentication before public exposure; Raven does not invent a private auth scheme in core.
+
 ## Development
 
 Requires Python 3.11+.
