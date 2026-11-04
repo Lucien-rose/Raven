@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import httpx
 from mcp.server import MCPServer
+from mcp.server.auth.provider import TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import Context
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -26,7 +28,7 @@ from raven.events import (
 )
 from raven.identity import request_principal
 from raven.judges import JevJudge, SemanticJudge
-from raven.mcp_events import OpenAIEvents, advertise_events
+from raven.mcp_events import MCPEvents, advertise_events
 from raven.runner import WatchRunner
 from raven.runtime import WatchRuntime
 from raven.scheduler import WatchScheduler
@@ -96,15 +98,6 @@ async def app_lifespan(_: MCPServer) -> AsyncIterator[AppContext]:
                     await task
 
 
-mcp = MCPServer(
-    "Raven",
-    lifespan=app_lifespan,
-    extensions=[OpenAIEvents()],
-    middleware=[advertise_events],
-)
-
-
-@mcp.tool()
 def create_watch(spec: WatchSpec, ctx: Context[AppContext]) -> WatchSpec:
     """Create a persistent Watch from a host-compiled WatchSpec."""
     owner = request_principal(ctx.request_context)
@@ -113,14 +106,12 @@ def create_watch(spec: WatchSpec, ctx: Context[AppContext]) -> WatchSpec:
     return watch
 
 
-@mcp.tool()
 def get_watch(watch_id: str, ctx: Context[AppContext]) -> WatchSpec | None:
     """Return one Watch by id."""
     owner = request_principal(ctx.request_context)
     return ctx.request_context.lifespan_context.storage.get_watch(watch_id, owner=owner)
 
 
-@mcp.tool()
 def list_watches(
     ctx: Context[AppContext],
     status: str | None = "active",
@@ -133,7 +124,6 @@ def list_watches(
     )
 
 
-@mcp.tool()
 def set_watch_status(
     watch_id: str,
     status: str,
@@ -148,7 +138,6 @@ def set_watch_status(
     )
 
 
-@mcp.tool()
 async def check_watch_now(
     watch_id: str,
     ctx: Context[AppContext],
@@ -162,7 +151,6 @@ async def check_watch_now(
     return await app.runner.run_once(watch)
 
 
-@mcp.tool()
 def get_event(
     event_id: str,
     ctx: Context[AppContext],
@@ -176,7 +164,6 @@ def get_event(
     )
 
 
-@mcp.tool()
 def get_event_status(
     event_id: str,
     ctx: Context[AppContext],
@@ -190,7 +177,6 @@ def get_event_status(
     )
 
 
-@mcp.tool()
 def list_pending_events(
     ctx: Context[AppContext],
     limit: int = 50,
@@ -204,7 +190,6 @@ def list_pending_events(
     )
 
 
-@mcp.tool()
 def acknowledge_event(
     event_id: str,
     ctx: Context[AppContext],
@@ -217,13 +202,48 @@ def acknowledge_event(
     )
 
 
-def main() -> None:
+def create_server(
+    *,
+    auth: AuthSettings | None = None,
+    token_verifier: TokenVerifier | None = None,
+) -> MCPServer[AppContext]:
+    server = MCPServer(
+        "Raven",
+        lifespan=app_lifespan,
+        extensions=[MCPEvents()],
+        middleware=[advertise_events],
+        auth=auth,
+        token_verifier=token_verifier,
+    )
+    for tool in (
+        create_watch,
+        get_watch,
+        list_watches,
+        set_watch_status,
+        check_watch_now,
+        get_event,
+        get_event_status,
+        list_pending_events,
+        acknowledge_event,
+    ):
+        server.add_tool(tool)
+    return server
+
+
+mcp = create_server()
+
+
+def run_server(server: MCPServer[AppContext]) -> None:
     transport = os.getenv("RAVEN_TRANSPORT", "stdio")
     if transport == "stdio":
-        mcp.run()
+        server.run()
         return
     if transport != "streamable-http":
         raise ValueError(f"Unsupported RAVEN_TRANSPORT: {transport!r}")
+    if server.settings.auth is None:
+        raise ValueError(
+            "Streamable HTTP requires an authenticated server created with create_server()"
+        )
 
     allowed_hosts = _csv_env("RAVEN_ALLOWED_HOSTS")
     allowed_origins = _csv_env("RAVEN_ALLOWED_ORIGINS")
@@ -234,13 +254,17 @@ def main() -> None:
             allowed_origins=allowed_origins,
         )
 
-    mcp.run(
+    server.run(
         transport="streamable-http",
         host=os.getenv("RAVEN_HOST", "127.0.0.1"),
         port=int(os.getenv("RAVEN_PORT", "8765")),
         streamable_http_path=os.getenv("RAVEN_MCP_PATH", "/mcp"),
         transport_security=security,
     )
+
+
+def main() -> None:
+    run_server(mcp)
 
 
 def _csv_env(name: str) -> list[str]:

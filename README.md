@@ -1,39 +1,41 @@
 # Raven
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 **Intent-driven monitoring infrastructure for AI agents.**
 
 > Tell your AI what you are waiting for. Raven keeps watch.
 
-Raven turns a long-lived intent into a persistent Watch. It observes supported sources, filters deterministic mismatches cheaply, optionally asks a pluggable semantic judge about ambiguous candidates, and hands high-value changes back to the host AI.
+Raven turns a long-lived intent into a persistent Watch. It observes supported APIs, tracks meaningful change, applies deterministic filters first, optionally delegates narrow semantic judgment, and sends relevant events back to the host AI.
 
-## Product principles
+## What Raven does
 
-- **Intent is the unit of monitoring.**
-- **Deterministic first.** Hard rules run before semantic judgment.
-- **Judgment is optional and pluggable.** Raven does not require a specific model.
-- **State matters.** Raven reacts to meaningful change, not just new objects.
-- **Host AI is the interface.** Raven is MCP-native; the host handles conversation, final scoring, and presentation.
-- **Respect the source.** Core adapters use documented APIs and feeds.
-
-## V1
-
-The first vertical slice is GitHub Issues:
+A Watch describes what the user is waiting for. Raven keeps that intent active over time.
 
 ```
 Host AI -> WatchSpec -> Raven
                       |
-GitHub API -> Item -> Diff -> Hard Rules -> Optional Judge -> Candidate -> Event -> Host AI
+Source API -> Item -> Diff -> Hard Rules -> Optional Judge -> Event -> Host AI
 ```
 
-The current GitHub adapter uses the documented REST API and persists ETag cursors. Diff state is tracked per Watch, so multiple intents can safely observe the same source without consuming each other's changes.
+V1 starts with GitHub Issues. The GitHub adapter uses the documented REST API and ETag cursors. Diff state is stored per Watch, so multiple Watches can observe the same source independently.
 
-Raven starts its scheduler inside the MCP server lifespan and shuts it down with the server. There are no hidden worker threads or import-time background tasks.
+Raven runs the scheduler inside the MCP server lifecycle and persists current state in SQLite.
+
+## Product principles
+
+- **Intent is the unit of monitoring.**
+- **Deterministic rules run first.**
+- **Semantic judgment is optional and pluggable.**
+- **Meaningful change triggers reevaluation.**
+- **The host AI handles final scoring, explanation, and presentation.**
+- **Core source adapters use documented APIs.**
 
 ## Semantic judges
 
-Judgment is a registry, not a hard dependency. A Watch can omit `judge` entirely and send every hard-rule candidate to the Host AI.
+A Watch can run with hard rules alone or opt into a semantic judge.
 
-The first bundled adapter is `jev`, using OpenRouter's Decisions API. Configure the server with:
+The first bundled judge adapter is Jev through OpenRouter Decisions:
 
 ```bash
 export RAVEN_JEV_API_KEY="..."
@@ -42,7 +44,7 @@ export RAVEN_JEV_API_KEY="..."
 export RAVEN_JEV_MODEL="typesafe/jev-1.14"
 ```
 
-Then a Watch can opt in with:
+Example Watch fragment:
 
 ```json
 {
@@ -55,97 +57,104 @@ Then a Watch can opt in with:
 }
 ```
 
-Secrets stay in the server environment rather than WatchSpec. The model and confidence threshold can vary per Watch.
+Judge credentials stay in the deployment environment. WatchSpec stores only the adapter choice and per-Watch settings.
 
 ## MCP Events
 
-Raven exposes `candidate.ready` through the MCP Events methods used by ChatGPT:
+Raven exposes `candidate.ready` through:
 
 - `events/list`
 - `events/subscribe`
 - `events/unsubscribe`
 
-Subscriptions are scoped to the authenticated principal and a specific Watch. One Raven event can fan out to multiple subscriptions without sharing delivery state.
+Subscriptions belong to an authenticated principal and a specific Watch. A single event can fan out to multiple subscriptions with independent delivery state.
 
-Raven verifies each webhook destination before saving the subscription, requires HTTPS, rejects private/local callback addresses, and signs callback requests with Standard Webhooks. Delivery failures use bounded exponential retry; permanent `410` and `413` responses are not retried.
+Webhook destinations are verified before subscription. Delivery uses HTTPS and Standard Webhooks signatures, with bounded retry for transient failures.
 
-The callback payload is intentionally compact:
+The callback payload carries a compact candidate summary. The full Candidate remains available through `get_event`.
 
-```json
-{
-  "eventId": "...",
-  "name": "candidate.ready",
-  "timestamp": "...",
-  "data": {
-    "event_id": "...",
-    "watch_id": "...",
-    "title": "...",
-    "url": "...",
-    "source_type": "github",
-    "source_id": "owner/repo"
-  },
-  "cursor": null
-}
-```
-
-The full Candidate remains in Raven and can be read with `get_event`. Successful webhook delivery and host acknowledgement are separate states.
-
-The current Python MCP SDK has public support for custom extension methods but does not yet model the top-level `events` capability directly. Raven keeps that compatibility shim isolated in `mcp_events.py`; Watch, Scheduler, Outbox, and delivery storage do not depend on it.
-
-Hosts without MCP Events can still use `list_pending_events`.
+Hosts without MCP Events can read `list_pending_events`.
 
 ## MCP tools
 
-- `create_watch` — persist a host-compiled WatchSpec.
-- `get_watch` — inspect one Watch.
-- `list_watches` — list active or all Watches.
-- `set_watch_status` — pause or reactivate a Watch.
-- `check_watch_now` — run one Watch through its source, diff, and judgment pipeline now.
-- `get_event` — fetch a full event after a compact delivery trigger.
-- `get_event_status` — inspect delivery, retry, and acknowledgement state.
-- `list_pending_events` — read unacknowledged events as a compatibility fallback.
-- `acknowledge_event` — acknowledge an event after the host consumes it.
+- `create_watch`
+- `get_watch`
+- `list_watches`
+- `set_watch_status`
+- `check_watch_now`
+- `get_event`
+- `get_event_status`
+- `list_pending_events`
+- `acknowledge_event`
 
-## Remote MCP
+## Self-hosting
 
-The same server can run locally over stdio or remotely over Streamable HTTP.
+Each Raven deployment owns its SQLite database, source credentials, judge credentials, and remote identity configuration.
+
+Local MCP clients can run Raven over stdio:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+raven
+```
+
+For GitHub API access:
+
+```bash
+export GITHUB_TOKEN="..."
+```
+
+### Remote MCP
+
+Remote deployments use Streamable HTTP and an OAuth 2.1 resource-server configuration supplied by the deployer.
+
+Raven exposes a server factory:
+
+```python
+from mcp.server.auth.settings import AuthSettings
+
+from my_identity import token_verifier
+from raven.server import create_server, run_server
+
+server = create_server(
+    auth=AuthSettings(
+        issuer_url="https://identity.example.com",
+        resource_server_url="https://raven.example.com/mcp",
+        required_scopes=["raven"],
+        validate_token_resource=False,
+    ),
+    token_verifier=token_verifier,
+)
+
+run_server(server)
+```
+
+The verifier may validate JWTs locally or use the identity provider's introspection endpoint. The authenticated token's subject becomes the Raven owner for Watches, subscriptions, and events.
+
+Runtime settings:
 
 ```bash
 export RAVEN_TRANSPORT="streamable-http"
 export RAVEN_HOST="127.0.0.1"
 export RAVEN_PORT="8765"
 export RAVEN_MCP_PATH="/mcp"
-raven
-```
-
-When a reverse proxy forwards a public hostname, explicitly allow that Host header:
-
-```bash
 export RAVEN_ALLOWED_HOSTS="raven.example.com,raven.example.com:*"
 ```
 
-Browser origins can be allowlisted separately with `RAVEN_ALLOWED_ORIGINS`.
-
-Keep Raven bound to localhost behind Caddy/nginx and terminate TLS at the proxy.
-
-Remote user-specific Watches and Events require an authenticated MCP endpoint. Raven scopes Watches, subscriptions, and event reads to the verified request principal; unauthenticated HTTP requests are rejected. Authentication is intentionally not implemented as a home-grown identity service in core.
+A reverse proxy such as Caddy can terminate TLS and forward the public MCP endpoint to Raven on localhost.
 
 ## Development
 
 Requires Python 3.11+.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 pip install -e ".[dev]"
-pytest
-raven
+ruff check .
+pytest -q
 ```
-
-For authenticated GitHub API access, set `GITHUB_TOKEN` in the server environment.
-
-The MCP server uses the official Python SDK.
 
 ## Status
 
-Early V1 construction. Contracts and behavior may change before the first tagged release.
+Raven is in early V1 development. Contracts may evolve before the first tagged release.

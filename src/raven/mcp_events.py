@@ -192,7 +192,7 @@ async def unsubscribe_event(
     return types.EmptyResult()
 
 
-class OpenAIEvents(Extension):
+class MCPEvents(Extension):
     identifier = EVENTS_EXTENSION_ID
 
     def methods(self) -> Sequence[MethodBinding]:
