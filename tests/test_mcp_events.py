@@ -3,11 +3,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from raven.mcp_events import OpenAIEvents, advertise_events, subscription_identity
+from raven.mcp_events import MCPEvents, advertise_events, subscription_identity
 
 
 def test_events_extension_exposes_standard_methods() -> None:
-    assert [binding.method for binding in OpenAIEvents().methods()] == [
+    assert [binding.method for binding in MCPEvents().methods()] == [
         "events/list",
         "events/subscribe",
         "events/unsubscribe",
